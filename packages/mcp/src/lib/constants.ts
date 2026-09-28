@@ -2,10 +2,25 @@ import { readFileSync } from "fs";
 import { fileURLToPath } from "url";
 import { dirname, join } from "path";
 
-const __dirname = dirname(fileURLToPath(import.meta.url));
-const pkg = JSON.parse(readFileSync(join(__dirname, "../../package.json"), "utf-8"));
+const FALLBACK_VERSION = "4.1.1";
 
-export const SERVER_VERSION: string = pkg.version;
+function resolveServerVersion(): string {
+  // Single-executable (SEA / pkg) builds have no package.json next to the
+  // bundle: import.meta.url points into the blob/exe, so the read below
+  // throws. Fall back to the build-time injected version or a static default.
+  try {
+    const __dirname = dirname(fileURLToPath(import.meta.url));
+    const pkg = JSON.parse(readFileSync(join(__dirname, "../../package.json"), "utf-8"));
+    if (typeof pkg.version === "string" && pkg.version.length > 0) {
+      return pkg.version;
+    }
+  } catch {
+    // ignore and use fallback below
+  }
+  return process.env.CONTEXT7_VERSION ?? FALLBACK_VERSION;
+}
+
+export const SERVER_VERSION: string = resolveServerVersion();
 
 const CONTEXT7_BASE_URL = "https://context7.com";
 const MCP_RESOURCE_URL = "https://mcp.context7.com";

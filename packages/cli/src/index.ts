@@ -66,7 +66,13 @@ registerUpgradeCommand(program);
 
 program.action(() => {
   console.log("");
-  const banner = figlet.textSync("Context7", { font: "ANSI Shadow" });
+  // figlet 在单文件 exe（SEA 打包）里可能找不到字体文件：降级为纯文本，保证可用。
+  let banner: string;
+  try {
+    banner = figlet.textSync("Context7", { font: "ANSI Shadow" });
+  } catch {
+    banner = "Context7";
+  }
   console.log(brand.primary(banner));
   console.log(brand.dim("  Documentation context for AI coding agents"));
   console.log("");
@@ -80,4 +86,8 @@ program.action(() => {
   console.log("");
 });
 
-await program.parseAsync();
+// 不用顶层 await：保持 CJS 输出兼容，单文件 exe（SEA 打包要求 CJS 入口）才能构建。
+program.parseAsync().catch((error: unknown) => {
+  console.error(error instanceof Error ? error.message : error);
+  process.exit(1);
+});

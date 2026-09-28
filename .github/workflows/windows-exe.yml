@@ -1,0 +1,197 @@
+name: Windows EXE
+
+# 在 GitHub 网页上在线编译 Windows 可执行文件并发布到 Releases：
+#   1. 打开仓库的 Actions -> Windows EXE -> Run workflow -> Run workflow
+#   2. 等待任务完成，在 Releases 页面会看到两个新版本：
+#      context7-mcp 的 Release（含 context7-mcp-windows-x64.exe）
+#      ctx7 CLI 的 Release（含 ctx7-windows-x64.exe）
+# 也可以推送一个 exe-v* / windows-v* 标签来触发（例如：git tag exe-v1 && git push origin exe-v1）。
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "exe-v*"
+      - "windows-v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows-exe:
+    name: Build Windows exes (mcp + cli)
+    runs-on: windows-latest
+    steps:
+      - name: Checkout Repo
+        uses: actions/checkout@v7
+
+      - name: Setup Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: "20"
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - name: Install Dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Read package versions
+        id: versions
+        shell: pwsh
+        run: |
+          $mcp = node -p "require('./packages/mcp/package.json').version"
+          $cli = node -p "require('./packages/cli/package.json').version"
+          "MCP_VERSION=$mcp" >> $env:GITHUB_OUTPUT
+          "CLI_VERSION=$cli" >> $env:GITHUB_OUTPUT
+          Write-Host "mcp version: $mcp"
+          Write-Host "cli version: $cli"
+
+      - name: Detect SEA sentinel fuse (once, shared)
+        shell: pwsh
+        run: |
+          # 不同 Node 大版本的 SEA 熔丝字符串不同（Node 20/22 已确认不同），
+          # 从当前 node.exe 二进制里动态提取，避免写死导致 "Could not find the sentinel"。
+          $nodePath = (Get-Command node).Source
+          Write-Host "node: $nodePath"
+          $fuse = python -c "import re,sys; data=open(sys.argv[1],'rb').read(); m=re.search(rb'NODE_SEA_FUSE_[0-9a-f]+', data); print(m.group(0).decode() if m else '')" "$nodePath"
+          if ([string]::IsNullOrWhiteSpace($fuse)) { throw "Failed to detect NODE_SEA_FUSE sentinel from $nodePath" }
+          Write-Host "fuse: $fuse"
+          "SEA_FUSE=$fuse" >> $env:GITHUB_ENV
+
+      # ---------------- context7-mcp.exe ----------------
+      - name: Bundle mcp with esbuild (single CJS file)
+        shell: pwsh
+        working-directory: packages/mcp
+        run: |
+          # 不跑 pnpm build：mcp 的 build 脚本里有 `chmod`，在 Windows 上会失败。
+          # 直接用 esbuild 打包出单文件，给下一步 SEA（Node Single Executable）用。
+          # 版本号由脚本经 JS API 烘焙进 bundle（pwsh 会吃掉 --define CLI 的引号，故不用 CLI 形式），
+          # exe 运行时身边没有 package.json 可读。
+          node ../../scripts/sea-bundle.cjs src/index.ts dist/sea-bundle.cjs "${{ steps.versions.outputs.MCP_VERSION }}"
+          python ../../scripts/sea-patch.py dist/sea-bundle.cjs
+
+      - name: Build context7-mcp.exe (SEA blob + postject)
+        shell: pwsh
+        working-directory: packages/mcp
+        run: |
+          @{ main = 'dist/sea-bundle.cjs'; output = 'dist/sea-prep.blob'; disableExperimentalSEAWarning = $true; useSnapshot = $false; useCodeCache = $false } | ConvertTo-Json | Set-Content -Path sea-config.json
+          node --experimental-sea-config sea-config.json
+          $nodePath = (Get-Command node).Source
+          Copy-Item $nodePath dist/context7-mcp.exe -Force
+          npx --yes postject dist/context7-mcp.exe NODE_SEA_BLOB dist/sea-prep.blob --sentinel-fuse "$env:SEA_FUSE"
+
+      - name: Smoke test context7-mcp.exe
+        shell: pwsh
+        working-directory: packages/mcp
+        run: |
+          .\dist\context7-mcp.exe --version
+          .\dist\context7-mcp.exe --help
+          $out = "context7-mcp-windows-x64.exe"
+          Move-Item dist/context7-mcp.exe $out -Force
+          $hash = (Get-FileHash $out -Algorithm SHA256).Hash.ToLower()
+          "$hash  $out" | Set-Content "$out.sha256.txt"
+
+      # ---------------- ctx7.exe (CLI) ----------------
+      - name: Bundle cli with esbuild (single CJS file)
+        shell: pwsh
+        working-directory: packages/cli
+        run: |
+          # 同上：直接 esbuild 打包，不依赖 tsup/chmod；版本号经构建脚本烘焙。
+          node ../../scripts/sea-bundle.cjs src/index.ts dist/sea-bundle.cjs "${{ steps.versions.outputs.CLI_VERSION }}"
+          # figlet 等依赖用 import.meta.url 定位资源文件，esbuild 的 CJS 输出里它恒为空，
+          # 模块初始化即崩；补丁把它接到 CJS 的 __filename 上，缺资源时走运行期降级。
+          python ../../scripts/sea-patch.py dist/sea-bundle.cjs
+
+      - name: Build ctx7.exe (SEA blob + postject)
+        shell: pwsh
+        working-directory: packages/cli
+        run: |
+          @{ main = 'dist/sea-bundle.cjs'; output = 'dist/sea-prep.blob'; disableExperimentalSEAWarning = $true; useSnapshot = $false; useCodeCache = $false } | ConvertTo-Json | Set-Content -Path sea-config.json
+          node --experimental-sea-config sea-config.json
+          $nodePath = (Get-Command node).Source
+          Copy-Item $nodePath dist/ctx7.exe -Force
+          npx --yes postject dist/ctx7.exe NODE_SEA_BLOB dist/sea-prep.blob --sentinel-fuse "$env:SEA_FUSE"
+
+      - name: Smoke test ctx7.exe
+        shell: pwsh
+        working-directory: packages/cli
+        run: |
+          .\dist\ctx7.exe --version
+          .\dist\ctx7.exe --help
+          # 无参数走 banner 分支（含 figlet 降级），确认不崩
+          .\dist\ctx7.exe | Select-Object -First 4
+          $out = "ctx7-windows-x64.exe"
+          Move-Item dist/ctx7.exe $out -Force
+          $hash = (Get-FileHash $out -Algorithm SHA256).Hash.ToLower()
+          "$hash  $out" | Set-Content "$out.sha256.txt"
+
+      # ---------------- two releases ----------------
+      - name: Resolve release tags
+        id: tag
+        shell: pwsh
+        run: |
+          if ($env:GITHUB_REF_TYPE -eq 'tag') {
+            $mcpTag = "$env:GITHUB_REF_NAME-mcp"
+            $cliTag = "$env:GITHUB_REF_NAME-cli"
+          } else {
+            $mcpTag = "mcp-windows-v${{ steps.versions.outputs.MCP_VERSION }}-${{ github.run_number }}"
+            $cliTag = "cli-windows-v${{ steps.versions.outputs.CLI_VERSION }}-${{ github.run_number }}"
+          }
+          "MCP_TAG=$mcpTag" >> $env:GITHUB_OUTPUT
+          "CLI_TAG=$cliTag" >> $env:GITHUB_OUTPUT
+          Write-Host "mcp tag: $mcpTag"
+          Write-Host "cli tag: $cliTag"
+
+      - name: Release context7-mcp.exe
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.MCP_TAG }}
+          name: ${{ steps.tag.outputs.MCP_TAG }}
+          body: |
+            Windows 可执行文件（免安装 Node，开箱即用）。
+
+            - `context7-mcp-windows-x64.exe`：Context7 MCP Server，版本 `${{ steps.versions.outputs.MCP_VERSION }}`，Node SEA 单文件打包。
+            - `context7-mcp-windows-x64.exe.sha256.txt`：SHA256 校验文件。
+
+            用法示例：
+
+            ```powershell
+            .\context7-mcp-windows-x64.exe --version
+            .\context7-mcp-windows-x64.exe --help
+            # stdio 模式（供 MCP 客户端调用，默认）
+            .\context7-mcp-windows-x64.exe
+            # http 模式
+            .\context7-mcp-windows-x64.exe --transport http --port 3000
+            ```
+          files: |
+            packages/mcp/context7-mcp-windows-x64.exe
+            packages/mcp/context7-mcp-windows-x64.exe.sha256.txt
+          generate_release_notes: true
+
+      - name: Release ctx7.exe
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.CLI_TAG }}
+          name: ${{ steps.tag.outputs.CLI_TAG }}
+          body: |
+            Windows 可执行文件（免安装 Node，开箱即用）。
+
+            - `ctx7-windows-x64.exe`：Context7 CLI（`ctx7`），版本 `${{ steps.versions.outputs.CLI_VERSION }}`，Node SEA 单文件打包。
+            - `ctx7-windows-x64.exe.sha256.txt`：SHA256 校验文件。
+
+            注意：exe 内 figlet 字体文件不可用时，启动 banner 自动降级为纯文本，不影响功能。
+
+            用法示例：
+
+            ```powershell
+            .\ctx7-windows-x64.exe --version
+            .\ctx7-windows-x64.exe --help
+            .\ctx7-windows-x64.exe setup
+            ```
+          files: |
+            packages/cli/ctx7-windows-x64.exe
+            packages/cli/ctx7-windows-x64.exe.sha256.txt
+          generate_release_notes: true
