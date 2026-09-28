@@ -1,4 +1,4 @@
-name: Windows EXE
+name: Build Windows EXE
 
 # 在 GitHub 网页上在线编译 Windows 可执行文件并发布到 Releases：
 #   1. 打开仓库的 Actions -> Windows EXE -> Run workflow -> Run workflow
