@@ -1,5 +1,72 @@
 # Changelog
 
+## 0.9.0
+
+### Minor Changes
+
+- 60e59f9: Add `ctx7 search <query>` to search documentation across all libraries in one step, without a library ID. Optional `--library`, `--library-version` and `--language` narrow the results, and `--json` returns structured output.
+
+### Patch Changes
+
+- ceaf5f9: Write the OpenCode MCP entry inside `mcp.servers` when the config already uses the OpenCode 2.x layout, without the 1.x `enabled` field. `ctx7 setup` also moves an entry that an earlier version wrote next to `mcp.servers`. Other configs keep the 1.x layout, which OpenCode 1.x and 2.x both read. `ctx7 remove` finds Context7 in either layout.
+- 35bd973: Show the update notice to canary users once the matching stable version is released.
+
+## 0.8.2
+
+### Patch Changes
+
+- b6ad942: Keep you signed in when several ctx7 commands run at once on an expired session. Each command used to refresh the token on its own, and two refreshes with the same token made the server revoke the whole session. Refreshes now take a lock file next to the credentials file: the first command refreshes and writes the new credentials, and the others wait for it and read them. A running command keeps its lock fresh, so a slow refresh is waited for, while a lock left behind by a crashed command is ignored after ten seconds and no command hangs on it. If the lock cannot be taken, for example on a read-only home directory, the command refreshes as before.
+
+## 0.8.1
+
+### Patch Changes
+
+- 5a2b651: Narrow the "Do not use for" line in the server instructions and rule templates so agents use Context7 when they port code between libraries, platforms, or SQL dialects.
+- 323bda9: Keep the comments and trailing commas in an OpenCode config file when `ctx7 setup` or `ctx7 remove` edits it.
+- 7f6943d: `ctx7 setup` now removes an existing `--api-key=<value>` arg when it rewrites a stdio MCP entry, so switching to OAuth or rotating the key no longer leaves the old key in the config.
+
+## 0.8.0
+
+### Minor Changes
+
+- 94cdfb1: Remove the deprecated `skills` and `generate` commands from `ctx7`; `ctx7 setup` still installs the find-docs and context7-mcp skills.
+
+## 0.7.0
+
+### Minor Changes
+
+- f54b372: Tell users when their Context7 session has expired instead of silently continuing without an account. If the server rejects the stored refresh token, the CLI clears the dead credentials. In a terminal it asks "Your Context7 session has expired. Sign in again now? (Y/n)" and, on yes, signs you in and continues the command. In scripts, agents, CI or with `--json` it never prompts; it prints a one-line notice to stderr and continues anonymously. Network errors, rate limits and server errors keep the credentials so the next command retries.
+
+## 0.6.1
+
+### Patch Changes
+
+- 615e72b: Update the Next.js examples in the tool descriptions, the CLI rule and the bundled skill: the version example is now `/vercel/next.js/v16.2.9`, and the prompts use Next.js 16.
+
+## 0.6.0
+
+### Minor Changes
+
+- 2c0f362: Add a `--language` option to `ctx7 docs`. When you pass the programming language you write in, Context7 ranks code examples in that language first.
+
+## 0.5.16
+
+### Patch Changes
+
+- 61cf806: Keep the rest of AGENTS.md / GEMINI.md untouched when `ctx7 remove` deletes the Context7 rule section; only the seam left by the removed section is normalized.
+
+## 0.5.15
+
+### Patch Changes
+
+- c1e314b: `ctx7 setup` now downloads the find-docs and context7-mcp skills directly from GitHub instead of the deprecated Skill Hub API.
+
+## 0.5.14
+
+### Patch Changes
+
+- 16095a9: Update CLI prompt, terminal display, and browser launch dependencies. The CLI now declares Node.js 22.13 or later, which its dependencies already need. Update the MCP server JWT and OpenTelemetry dependencies.
+
 ## 0.5.13
 
 ### Patch Changes

@@ -23,9 +23,25 @@ const BASE_PORT = 43117;
 const STUB_DOCS = "stub docs text";
 const EMPTY_CONTEXT_QUERY = "force-empty-context";
 const NO_RESULTS_QUERY = "force-no-results";
+const FILTERED_NO_RESULTS_QUERY = "force-filtered-no-results";
 const UPSTREAM_ERROR_QUERY = "force-upstream-error";
+const SLOW_CONTEXT_QUERY = "force-slow-context";
 const INVALID_JSON_QUERY = "force-invalid-json";
+const STUB_UPGRADE_GUIDE = "# Upgrading Next.js from 14 to 16";
+const PREPARING_FROM_VERSION = "13";
+const UNKNOWN_FROM_VERSION = "99";
+/** A deployment without the endpoint answers a plain 404. */
+const MISSING_ENDPOINT_FROM_VERSION = "98";
 const CLIENT_IP_ASSERTION_KEY = "0123456789abcdef".repeat(4);
+const INVALID_OAUTH_TOKEN_BODY = {
+  error: "invalid_oauth_token",
+  message: "Invalid or expired OAuth token. Please re-authenticate to obtain a new token.",
+};
+const INVALID_API_KEY_BODY = {
+  error: "invalid_api_key",
+  message:
+    "Invalid API key. Please check your API key. API keys should start with 'ctx7sk' prefix.",
+};
 
 function decryptClientIpAssertion(value: string): string {
   const [version, timestamp, nonceHex, ciphertextAndTagHex] = value.split(":");
@@ -50,6 +66,7 @@ interface RecordedRequest {
 }
 
 const requests: RecordedRequest[] = [];
+const feedbackBodies: unknown[] = [];
 let stubServer: http.Server;
 let childEnv: Record<string, string>;
 let httpChild: ChildProcess;
@@ -83,6 +100,74 @@ function startStubApi(): Promise<string> {
     const url = new URL(req.url!, "http://stub.local");
     const apiPath = url.pathname.replace(/^\/api/, "");
     requests.push({ path: apiPath, query: url.searchParams, headers: req.headers });
+    const bearer = /^Bearer (.+)$/.exec(req.headers.authorization ?? "")?.[1] ?? "";
+    if (apiPath === "/v2/feedback") {
+      let body = "";
+      req.on("data", (chunk: Buffer) => (body += chunk.toString()));
+      req.on("end", () => {
+        feedbackBodies.push(JSON.parse(body));
+        res.statusCode = 201;
+        res.setHeader("Content-Type", "application/json");
+        res.end(JSON.stringify({ id: "stub-feedback" }));
+      });
+      return;
+    }
+    if (apiPath === "/v2/version-upgrade-guide") {
+      const fromVersion = url.searchParams.get("fromVersion");
+      if (fromVersion === PREPARING_FROM_VERSION) {
+        res.statusCode = 202;
+        res.setHeader("Content-Type", "application/json");
+        res.end(
+          JSON.stringify({
+            status: "preparing",
+            retryAfter: 90,
+            message: "Indexing the source of next.js 13.0.0.",
+          })
+        );
+      } else if (fromVersion === MISSING_ENDPOINT_FROM_VERSION) {
+        res.statusCode = 404;
+        res.setHeader("Content-Type", "text/html");
+        res.end("<html>Not Found</html>");
+      } else if (fromVersion === UNKNOWN_FROM_VERSION) {
+        res.statusCode = 404;
+        res.setHeader("Content-Type", "application/json");
+        res.end(
+          JSON.stringify({ error: "version_not_found", message: "No release 99 of next.js." })
+        );
+      } else {
+        res.setHeader("Content-Type", "text/plain");
+        res.end(STUB_UPGRADE_GUIDE);
+      }
+      return;
+    }
+    if (apiPath === "/v2/auth/check") {
+      // Mirrors context7app: the middleware answers invalid_oauth_token for a
+      // rejected oat_ bearer, the handler answers 204 for an accepted one.
+      if (bearer.startsWith("oat_outage")) {
+        res.statusCode = 503;
+        res.end();
+      } else if (bearer.startsWith("oat_") && !bearer.startsWith("oat_valid")) {
+        res.statusCode = 401;
+        res.setHeader("Content-Type", "application/json");
+        res.end(JSON.stringify(INVALID_OAUTH_TOKEN_BODY));
+      } else {
+        res.statusCode = 204;
+        res.end();
+      }
+      return;
+    }
+    if (apiPath === "/v2/context" && bearer.startsWith("oat_") && !bearer.startsWith("oat_valid")) {
+      res.statusCode = 401;
+      res.setHeader("Content-Type", "application/json");
+      res.end(JSON.stringify(INVALID_OAUTH_TOKEN_BODY));
+      return;
+    }
+    if (apiPath === "/v2/context" && bearer.startsWith("ctx7sk-invalid")) {
+      res.statusCode = 401;
+      res.setHeader("Content-Type", "application/json");
+      res.end(JSON.stringify(INVALID_API_KEY_BODY));
+      return;
+    }
     if (apiPath === "/v2/libs/search") {
       res.setHeader("Content-Type", "application/json");
       if (url.searchParams.get("query") === INVALID_JSON_QUERY) {
@@ -91,6 +176,10 @@ function startStubApi(): Promise<string> {
       }
       if (url.searchParams.get("query") === NO_RESULTS_QUERY) {
         res.end(JSON.stringify({ results: [] }));
+        return;
+      }
+      if (url.searchParams.get("query") === FILTERED_NO_RESULTS_QUERY) {
+        res.end(JSON.stringify({ results: [], searchFilterApplied: true }));
         return;
       }
       res.end(
@@ -117,6 +206,10 @@ function startStubApi(): Promise<string> {
         return;
       }
       res.setHeader("Content-Type", "text/plain");
+      if (url.searchParams.get("query") === SLOW_CONTEXT_QUERY) {
+        setTimeout(() => res.end(STUB_DOCS), 500);
+        return;
+      }
       res.end(url.searchParams.get("query") === EMPTY_CONTEXT_QUERY ? "" : STUB_DOCS);
     } else {
       res.statusCode = 404;
@@ -179,6 +272,7 @@ beforeAll(async () => {
     OTEL_EXPORTER_PROMETHEUS_HOST: "127.0.0.1",
     OTEL_EXPORTER_PROMETHEUS_PORT: String(metricsPort),
     MCP_CLIENT_IP_ASSERTION_KEY: CLIENT_IP_ASSERTION_KEY,
+    MCP_AUTH_ENFORCEMENT: "required",
   };
   ({ child: httpChild, url: httpUrl } = await startHttpChild());
 }, 120_000);
@@ -186,6 +280,104 @@ beforeAll(async () => {
 afterAll(() => {
   httpChild?.kill();
   stubServer?.close();
+});
+
+test("reports the bound port when port zero requests an ephemeral port", async () => {
+  const { child, url } = await startHttpChild({ port: 0 });
+  try {
+    expect(new URL(url).port).not.toBe("0");
+
+    const response = await fetch(new URL("/ping", url));
+    expect(response.ok).toBe(true);
+    await expect(response.json()).resolves.toMatchObject({ status: "ok" });
+  } finally {
+    child.kill();
+  }
+});
+
+// A modern query-docs call over a caller-chosen agent, so tests control socket reuse.
+function callQueryDocsOver(url: string, agent: http.Agent, query: string) {
+  return new Promise<{ status: number; connection: string | undefined }>((resolve, reject) => {
+    const req = http.request(
+      url,
+      {
+        method: "POST",
+        agent,
+        headers: {
+          "content-type": "application/json",
+          accept: "application/json, text/event-stream",
+          authorization: "Bearer ctx7sk-local-test",
+          "mcp-protocol-version": "2026-07-28",
+          "mcp-method": "tools/call",
+          "mcp-name": "query-docs",
+        },
+      },
+      (res) => {
+        res.resume();
+        res.on("end", () =>
+          resolve({ status: res.statusCode!, connection: res.headers.connection })
+        );
+      }
+    );
+    req.on("error", reject);
+    req.end(
+      JSON.stringify({
+        jsonrpc: "2.0",
+        id: 1,
+        method: "tools/call",
+        params: {
+          name: "query-docs",
+          arguments: { libraryId: "/vercel/next.js", query },
+          _meta: {
+            "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+            "io.modelcontextprotocol/clientCapabilities": {},
+          },
+        },
+      })
+    );
+  });
+}
+
+describe("HTTP shutdown", () => {
+  test("serves requests that arrive on a kept-alive socket during shutdown", async () => {
+    const { child, url } = await startHttpChild({ port: 0 });
+    const exited = new Promise<number | null>((resolve) => child.once("exit", resolve));
+    // One socket, so the second request reuses the connection of the first.
+    const agent = new http.Agent({ keepAlive: true, maxSockets: 1 });
+    try {
+      const inFlight = callQueryDocsOver(url, agent, SLOW_CONTEXT_QUERY);
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      child.kill("SIGTERM");
+      // Queued behind the in-flight call, so it reaches the server after SIGTERM.
+      const afterSignal = callQueryDocsOver(url, agent, "app router");
+
+      expect((await inFlight).status).toBe(200);
+      expect(await afterSignal).toEqual({ status: 200, connection: "close" });
+      expect(await exited).toBe(0);
+    } finally {
+      agent.destroy();
+      child.kill();
+    }
+  });
+
+  test("exits cleanly when a request in flight at SIGTERM leaves its socket open", async () => {
+    const { child, url } = await startHttpChild({ port: 0 });
+    const exited = new Promise<number | null>((resolve) => child.once("exit", resolve));
+    const agent = new http.Agent({ keepAlive: true });
+    try {
+      const inFlight = callQueryDocsOver(url, agent, SLOW_CONTEXT_QUERY);
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      child.kill("SIGTERM");
+
+      // The response began before SIGTERM, so it keeps the socket alive and the
+      // client sends nothing more; shutdown must still finish inside its limit.
+      expect(await inFlight).toEqual({ status: 200, connection: "keep-alive" });
+      expect(await exited).toBe(0);
+    } finally {
+      agent.destroy();
+      child.kill();
+    }
+  });
 });
 
 async function connect(transportKind: "http" | "stdio", era: "modern" | "legacy") {
@@ -200,6 +392,7 @@ async function connect(transportKind: "http" | "stdio", era: "modern" | "legacy"
           // info) is observable; modern clients must beat it via the envelope.
           requestInit: {
             headers: {
+              Authorization: "Bearer ctx7sk-local-test",
               "user-agent": "ua-fallback/9.9.9",
               "x-forwarded-for": "attacker-selected-bucket, 203.0.113.77",
             },
@@ -218,6 +411,19 @@ describe("OAuth discovery", () => {
     expect(response.status).toBe(200);
     expect(await response.json()).toMatchObject({
       resource: "https://mcp.context7.com",
+      authorization_servers: ["https://clerk.context7.com", "https://context7.com"],
+    });
+  });
+
+  test.each([
+    ["/mcp", "/.well-known/oauth-protected-resource/mcp"],
+    ["/mcp/oauth", "/.well-known/oauth-protected-resource/mcp/oauth"],
+  ])("advertises endpoint-specific metadata for %s", async (endpoint, metadataPath) => {
+    const response = await fetch(new URL(metadataPath, httpUrl));
+
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({
+      resource: `https://mcp.context7.com${endpoint}`,
       authorization_servers: ["https://clerk.context7.com", "https://context7.com"],
     });
   });
@@ -361,7 +567,11 @@ describe.each([
   test("is not reported as a parse error", async () => {
     const response = await fetch(new URL("/mcp", httpUrl), {
       method: "POST",
-      headers: { "Content-Type": "application/json", Accept: "application/json" },
+      headers: {
+        "Content-Type": "application/json",
+        Accept: "application/json",
+        Authorization: "Bearer ctx7sk-local-test",
+      },
       body,
     });
 
@@ -393,6 +603,336 @@ describe("HTTP API key headers", () => {
     } finally {
       await client.close();
     }
+  });
+});
+
+describe("research preview", () => {
+  // The preview tool list differs per caller, so a shared cache must not serve it to others.
+  async function toolsListCacheScope(
+    transport: StreamableHTTPClientTransport | StdioClientTransport
+  ) {
+    const client = new Client(
+      { name: "research-preview-test", version: "1.0.0" },
+      { versionNegotiation: { mode: { pin: "2026-07-28" } } }
+    );
+    await client.connect(transport);
+    try {
+      return ((await client.listTools()) as { cacheScope?: string }).cacheScope;
+    } finally {
+      await client.close();
+    }
+  }
+
+  const httpTransport = (url: string) =>
+    new StreamableHTTPClientTransport(new URL(url), {
+      requestInit: { headers: { Authorization: "Bearer ctx7sk-local-test" } },
+    });
+  const stdioTransport = (env: Record<string, string>) =>
+    new StdioClientTransport({ command: process.execPath, args: [DIST], env });
+
+  test("marks tools/list private over HTTP only with ?research_preview=1", async () => {
+    expect(await toolsListCacheScope(httpTransport(httpUrl))).toBe("public");
+    expect(await toolsListCacheScope(httpTransport(`${httpUrl}?research_preview=1`))).toBe(
+      "private"
+    );
+  });
+
+  test("marks tools/list private over stdio only with CONTEXT7_RESEARCH_PREVIEW=1", async () => {
+    expect(await toolsListCacheScope(stdioTransport(childEnv))).toBe("public");
+    expect(
+      await toolsListCacheScope(stdioTransport({ ...childEnv, CONTEXT7_RESEARCH_PREVIEW: "1" }))
+    ).toBe("private");
+  });
+
+  test("lists submit-docs-feedback only with research preview and sends it to the API", async () => {
+    const toolNames = async (url: string) => {
+      const client = new Client({ name: "research-preview-test", version: "1.0.0" });
+      await client.connect(httpTransport(url));
+      try {
+        return (await client.listTools()).tools.map((tool) => tool.name);
+      } finally {
+        await client.close();
+      }
+    };
+    expect(await toolNames(httpUrl)).not.toContain("submit-docs-feedback");
+    expect(await toolNames(`${httpUrl}?research_preview=1`)).toContain("submit-docs-feedback");
+
+    const client = new Client({ name: "research-preview-test", version: "1.0.0" });
+    await client.connect(httpTransport(`${httpUrl}?research_preview=1`));
+    try {
+      feedbackBodies.length = 0;
+      requests.length = 0;
+      const feedback = {
+        libraryId: "/vercel/next.js",
+        query: "app router caching",
+        score: 2,
+        issue: "outdated",
+        comment: "Shows the Next.js 14 cache defaults.",
+      };
+      const result = await client.callTool({ name: "submit-docs-feedback", arguments: feedback });
+
+      expect(result.isError).toBeFalsy();
+      expect(feedbackBodies).toEqual([feedback]);
+      const apiCall = requests.find((request) => request.path === "/v2/feedback");
+      expect(apiCall?.headers.authorization).toBe("Bearer ctx7sk-local-test");
+      expect(apiCall?.headers["x-context7-source"]).toBe("mcp-server");
+      expect(apiCall?.headers["x-context7-research-preview"]).toBe("1");
+    } finally {
+      await client.close();
+    }
+  });
+});
+
+describe("research preview: get-upgrade-guide", () => {
+  const previewTransport = (url: string) =>
+    new StreamableHTTPClientTransport(new URL(url), {
+      requestInit: { headers: { Authorization: "Bearer ctx7sk-local-test" } },
+    });
+
+  async function withClient<T>(url: string, run: (client: Client) => Promise<T>): Promise<T> {
+    const client = new Client({ name: "research-preview-test", version: "1.0.0" });
+    await client.connect(previewTransport(url));
+    try {
+      return await run(client);
+    } finally {
+      await client.close();
+    }
+  }
+
+  const callGuide = (args: Record<string, string>) =>
+    withClient(`${httpUrl}?research_preview=1`, (client) =>
+      client.callTool({
+        name: "get-upgrade-guide",
+        arguments: { libraryId: "/vercel/next.js", ...args },
+      })
+    );
+  const resultText = (result: Awaited<ReturnType<typeof callGuide>>) =>
+    (result.content as { type: string; text: string }[])[0].text;
+
+  beforeEach(() => {
+    requests.length = 0;
+  });
+
+  test("is listed only with research preview", async () => {
+    const toolNames = (url: string) =>
+      withClient(url, async (client) => (await client.listTools()).tools.map((tool) => tool.name));
+    expect(await toolNames(httpUrl)).not.toContain("get-upgrade-guide");
+    expect(await toolNames(`${httpUrl}?research_preview=1`)).toContain("get-upgrade-guide");
+  });
+
+  test("sends the versions to the API and returns the guide text", async () => {
+    const result = await callGuide({ fromVersion: "14.2.35", toVersion: "16" });
+
+    expect(result.isError).toBeFalsy();
+    expect(resultText(result)).toBe(STUB_UPGRADE_GUIDE);
+    const apiCall = requests.find((request) => request.path === "/v2/version-upgrade-guide");
+    expect(Object.fromEntries(apiCall!.query)).toEqual({
+      libraryId: "/vercel/next.js",
+      fromVersion: "14.2.35",
+      toVersion: "16",
+    });
+    expect(apiCall?.headers.authorization).toBe("Bearer ctx7sk-local-test");
+    expect(apiCall?.headers["x-context7-source"]).toBe("mcp-server");
+    expect(apiCall?.headers["x-context7-research-preview"]).toBe("1");
+  });
+
+  test("omits toVersion when not given", async () => {
+    await callGuide({ fromVersion: "14" });
+
+    const apiCall = requests.find((request) => request.path === "/v2/version-upgrade-guide");
+    expect(apiCall?.query.has("toVersion")).toBe(false);
+  });
+
+  test("tells the agent to call again while the guide is prepared", async () => {
+    const result = await callGuide({ fromVersion: PREPARING_FROM_VERSION });
+
+    expect(result.isError).toBeFalsy();
+    expect(resultText(result)).toContain("being prepared");
+    expect(resultText(result)).toContain("after 90 seconds");
+    expect(resultText(result)).toContain("Indexing the source of next.js 13.0.0.");
+  });
+
+  test("returns the API's 404 message as an answer, not an error", async () => {
+    const result = await callGuide({ fromVersion: UNKNOWN_FROM_VERSION });
+
+    expect(result.isError).toBeFalsy();
+    expect(resultText(result)).toBe("No release 99 of next.js.");
+  });
+
+  test("reports a 404 that is not the endpoint's answer as an upstream error", async () => {
+    const result = await callGuide({ fromVersion: MISSING_ENDPOINT_FROM_VERSION });
+
+    expect(resultText(result)).toContain("not available");
+    expect(resultText(result)).not.toContain("library");
+  });
+});
+
+describe("HTTP batch cancellation", () => {
+  beforeEach(() => {
+    requests.length = 0;
+  });
+
+  test("consumes a request cancelled by the same batch and closes promptly", async () => {
+    const response = await fetch(httpUrl, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        accept: "application/json, text/event-stream",
+        authorization: "Bearer ctx7sk-local-test",
+      },
+      body: JSON.stringify([
+        {
+          jsonrpc: "2.0",
+          id: 102,
+          method: "tools/call",
+          params: {
+            name: "resolve-library-id",
+            arguments: { query: "framework documentation", libraryName: "Next.js" },
+          },
+        },
+        {
+          jsonrpc: "2.0",
+          method: "notifications/cancelled",
+          params: { requestId: 102, reason: "regression-test" },
+        },
+      ]),
+      signal: AbortSignal.timeout(1_000),
+    });
+
+    expect(response.status).toBe(202);
+    expect(await response.text()).toBe("");
+    expect(requests).toHaveLength(0);
+  });
+
+  test("returns responses for the uncancelled requests in a mixed batch", async () => {
+    const response = await fetch(httpUrl, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        accept: "application/json, text/event-stream",
+        authorization: "Bearer ctx7sk-local-test",
+      },
+      body: JSON.stringify([
+        {
+          jsonrpc: "2.0",
+          id: 104,
+          method: "tools/call",
+          params: {
+            name: "resolve-library-id",
+            arguments: { query: "cancelled", libraryName: "Cancelled.js" },
+          },
+        },
+        {
+          jsonrpc: "2.0",
+          id: 105,
+          method: "tools/call",
+          params: {
+            name: "resolve-library-id",
+            arguments: { query: "framework documentation", libraryName: "Next.js" },
+          },
+        },
+        {
+          jsonrpc: "2.0",
+          method: "notifications/cancelled",
+          params: { requestId: 104, reason: "regression-test" },
+        },
+      ]),
+      signal: AbortSignal.timeout(1_000),
+    });
+
+    expect(response.status).toBe(200);
+    const responseText = await response.text();
+    expect(responseText).not.toContain('"id":104');
+    expect(responseText).toContain('"id":105');
+    expect(requests.filter((request) => request.path === "/v2/libs/search")).toHaveLength(1);
+    expect(requests[0].query.get("libraryName")).toBe("Next.js");
+  });
+
+  test("allows a cancellation for an ID outside the batch", async () => {
+    const response = await fetch(httpUrl, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        accept: "application/json, text/event-stream",
+        authorization: "Bearer ctx7sk-local-test",
+      },
+      body: JSON.stringify([
+        {
+          jsonrpc: "2.0",
+          id: 103,
+          method: "tools/call",
+          params: {
+            name: "resolve-library-id",
+            arguments: { query: "framework documentation", libraryName: "Next.js" },
+          },
+        },
+        {
+          jsonrpc: "2.0",
+          method: "notifications/cancelled",
+          params: { requestId: 999, reason: "different-request" },
+        },
+      ]),
+      signal: AbortSignal.timeout(1_000),
+    });
+
+    expect(response.status).toBe(200);
+    expect(await response.text()).toContain('"id":103');
+    expect(requests.filter((request) => request.path === "/v2/libs/search")).toHaveLength(1);
+  });
+
+  test("leaves a batch with a 2026-07-28 element to the SDK, which rejects it", async () => {
+    const modernParams = { _meta: { "io.modelcontextprotocol/protocolVersion": "2026-07-28" } };
+    const response = await fetch(httpUrl, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        accept: "application/json, text/event-stream",
+        authorization: "Bearer ctx7sk-local-test",
+      },
+      body: JSON.stringify([
+        { jsonrpc: "2.0", id: 107, method: "tools/list", params: modernParams },
+        {
+          jsonrpc: "2.0",
+          method: "notifications/cancelled",
+          params: { requestId: 107, reason: "regression-test" },
+        },
+        {
+          jsonrpc: "2.0",
+          id: 108,
+          method: "tools/call",
+          params: {
+            name: "resolve-library-id",
+            arguments: { query: "framework documentation", libraryName: "Next.js" },
+          },
+        },
+      ]),
+      signal: AbortSignal.timeout(1_000),
+    });
+
+    expect(response.status).toBe(400);
+    expect(requests).toHaveLength(0);
+  });
+
+  test("keeps 405 for a self-cancelling batch sent with DELETE", async () => {
+    const response = await fetch(httpUrl, {
+      method: "DELETE",
+      headers: {
+        "content-type": "application/json",
+        accept: "application/json, text/event-stream",
+        authorization: "Bearer ctx7sk-local-test",
+      },
+      body: JSON.stringify([
+        { jsonrpc: "2.0", id: 106, method: "tools/list" },
+        {
+          jsonrpc: "2.0",
+          method: "notifications/cancelled",
+          params: { requestId: 106, reason: "regression-test" },
+        },
+      ]),
+      signal: AbortSignal.timeout(1_000),
+    });
+
+    expect(response.status).toBe(405);
   });
 });
 
@@ -432,6 +972,7 @@ describe.each([
     ]);
     const queryDocs = tools.find((t) => t.name === "query-docs")!;
     expect(Object.keys(queryDocs.inputSchema.properties ?? {}).sort()).toEqual([
+      "language",
       "libraryId",
       "query",
     ]);
@@ -459,6 +1000,7 @@ describe.each([
     expect(apiCalls[0].query.get("libraryId")).toBe("/vercel/next.js");
     expect(apiCalls[0].query.get("query")).toBe("app router");
     expect(apiCalls[0].headers["x-context7-transport"]).toBe(transportKind);
+    expect(apiCalls[0].headers["x-context7-research-preview"]).toBeUndefined();
     if (transportKind === "http") {
       expect(apiCalls[0].headers["mcp-client-ip-assertion"]).toMatch(/^v1:/);
       expect(
@@ -470,6 +1012,47 @@ describe.each([
     }
   });
 
+  test("flags a failed query-docs lookup as an error result", async () => {
+    const result = await client.callTool({
+      name: "query-docs",
+      arguments: { libraryId: "/vercel/next.js", query: UPSTREAM_ERROR_QUERY },
+    });
+    expect(result.isError).toBe(true);
+    const text = (result.content as { type: string; text: string }[])[0].text;
+    expect(text).toContain("stub upstream failure");
+  });
+
+  test("flags a failed resolve-library-id search as an error, not an empty match", async () => {
+    const failed = await client.callTool({
+      name: "resolve-library-id",
+      arguments: { libraryName: "Next.js", query: INVALID_JSON_QUERY },
+    });
+    expect(failed.isError).toBe(true);
+
+    const empty = await client.callTool({
+      name: "resolve-library-id",
+      arguments: { libraryName: "does-not-exist", query: NO_RESULTS_QUERY },
+    });
+    expect(empty.isError).toBeFalsy();
+  });
+
+  test("keeps the filter notice when no libraries match", async () => {
+    const result = await client.callTool({
+      name: "resolve-library-id",
+      arguments: { libraryName: "Next.js", query: FILTERED_NO_RESULTS_QUERY },
+    });
+    expect(result.isError).toBeFalsy();
+    expect(result.content).toEqual([
+      {
+        type: "text",
+        text: expect.stringContaining("teamspace's library filters"),
+      },
+    ]);
+    const text = (result.content as { type: string; text: string }[])[0].text;
+    expect(text).toContain("https://context7.com/dashboard?tab=policies");
+    expect(text).toContain("No documentation libraries found matching your query.");
+  });
+
   test("calls resolve-library-id end to end", async () => {
     const result = await client.callTool({
       name: "resolve-library-id",
@@ -479,6 +1062,24 @@ describe.each([
     const text = (result.content as { type: string; text: string }[])[0].text;
     expect(text).toContain("Available Libraries");
     expect(text).toContain("/vercel/next.js");
+  });
+
+  test("forwards the language hint to the context endpoint", async () => {
+    await client.callTool({
+      name: "query-docs",
+      arguments: { libraryId: "/websites/twilio", query: "send an SMS", language: "Python" },
+    });
+    expect(requests.find((r) => r.path === "/v2/context")!.query.get("language")).toBe("Python");
+  });
+
+  test("accepts a long language hint instead of rejecting the call", async () => {
+    const language = "TypeScript with React 19 and Next.js 16 app router";
+    const result = await client.callTool({
+      name: "query-docs",
+      arguments: { libraryId: "/vercel/next.js", query: "app router", language },
+    });
+    expect(result.isError).toBeFalsy();
+    expect(requests.find((r) => r.path === "/v2/context")!.query.get("language")).toBe(language);
   });
 
   test("rewrites hallucinated argument aliases before validation", async () => {
@@ -551,7 +1152,11 @@ describe("OpenTelemetry metrics", () => {
     );
 
     try {
-      await client.connect(new StreamableHTTPClientTransport(new URL(disabledServer.url)));
+      await client.connect(
+        new StreamableHTTPClientTransport(new URL(disabledServer.url), {
+          requestInit: { headers: { Authorization: "Bearer ctx7sk-local-test" } },
+        })
+      );
       const result = await client.callTool({
         name: "query-docs",
         arguments: { libraryId: "/vercel/next.js", query: "disabled telemetry" },
@@ -571,6 +1176,7 @@ describe("OpenTelemetry metrics", () => {
       headers: {
         accept: "application/json, text/event-stream",
         "content-type": "application/json",
+        authorization: "Bearer ctx7sk-local-test",
       },
       body: JSON.stringify([
         { jsonrpc: "2.0", id: 90_001, method: "tools/list", params: {} },
@@ -697,11 +1303,30 @@ describe("OpenTelemetry metrics", () => {
         )
     ).toBe(true);
     expect(exported).toMatch(
-      /context7_mcp_authentication_attempts_total\{[^}]*context7_authentication_outcome="missing"[^}]*\} 1/
+      /context7_mcp_authentication_attempts_total\{[^}]*context7_authentication_outcome="missing"[^}]*\} [1-9][0-9]*/
     );
     expect(exported).toMatch(
-      /context7_mcp_authentication_attempts_total\{[^}]*context7_authentication_outcome="accepted"[^}]*\} 1/
+      /context7_mcp_authentication_attempts_total\{[^}]*context7_authentication_outcome="accepted"[^}]*\} [1-9][0-9]*/
     );
+    const authenticationEvents = exported
+      .split("\n")
+      .filter((line) => line.startsWith("context7_mcp_authentication_events_total{"));
+    expect(
+      authenticationEvents.some(
+        (line) =>
+          line.includes('context7_authentication_event="challenge_issued"') &&
+          line.includes('context7_authentication_method="none"') &&
+          line.includes('context7_mcp_route="oauth"')
+      )
+    ).toBe(true);
+    expect(
+      authenticationEvents.some(
+        (line) =>
+          line.includes('context7_authentication_event="credential_present"') &&
+          line.includes('context7_authentication_method="api_key"') &&
+          line.includes('context7_mcp_route="oauth"')
+      )
+    ).toBe(true);
     expect(exported).toContain("context7_mcp_authentication_duration_count");
     expect(exported).toContain("context7_mcp_authentication_active");
     expect(exported).toContain("mcp_server_operation_duration_bucket");
@@ -757,29 +1382,148 @@ async function postMcp(target: string, headers: Record<string, string> = {}) {
     },
     body: JSON.stringify(INITIALIZE),
   });
-  return { status: res.status, wwwAuthenticate: res.headers.get("www-authenticate") };
+  return {
+    status: res.status,
+    wwwAuthenticate: res.headers.get("www-authenticate"),
+    exposeHeaders: res.headers.get("access-control-expose-headers"),
+    body: await res.text(),
+  };
 }
 
-describe("plugin authentication", () => {
+async function callQueryDocs(target: string, headers: Record<string, string>): Promise<string> {
+  const client = new Client(
+    { name: "test-harness", version: "1.0.0" },
+    { versionNegotiation: { mode: { pin: "2026-07-28" } } }
+  );
+  await client.connect(
+    new StreamableHTTPClientTransport(new URL(target), { requestInit: { headers } })
+  );
+  try {
+    const result = await client.callTool({
+      name: "query-docs",
+      arguments: { libraryId: "/vercel/next.js", query: "app router" },
+    });
+    return (result.content as { type: string; text: string }[])[0].text;
+  } finally {
+    await client.close();
+  }
+}
+
+function authChecks(): RecordedRequest[] {
+  return requests.filter((request) => request.path === "/v2/auth/check");
+}
+
+describe("hosted HTTP authentication", () => {
   beforeEach(() => {
     requests.length = 0;
   });
 
-  test("only challenges the supported plugin", async () => {
-    expect((await postMcp(`${httpUrl}?client=other-plugin`)).status).toBe(200);
+  test.each([undefined, "", "other-plugin", "claude-code-plugin"])(
+    "challenges unauthenticated clients (%s)",
+    async (client) => {
+      const target = client ? `${httpUrl}?client=${client}` : httpUrl;
+      const res = await postMcp(target, client === "" ? { Authorization: "" } : undefined);
 
-    const res = await postMcp(`${httpUrl}?client=claude-code-plugin`);
-    expect(res.status).toBe(401);
-    expect(res.wwwAuthenticate).toContain("resource_metadata=");
-    expect(res.wwwAuthenticate).toContain("/.well-known/oauth-protected-resource");
+      expect(res.status).toBe(401);
+      expect(res.wwwAuthenticate).toContain(
+        'resource_metadata="https://mcp.context7.com/.well-known/oauth-protected-resource/mcp"'
+      );
+    }
+  );
+
+  // Node trims header values, so an unset `Bearer ${KEY}` arrives as the bare
+  // scheme; it must count as a missing credential, whatever its case.
+  test.each(["Bearer ", "bearer", "BEARER  "])(
+    "challenges a Bearer header without a token (%j)",
+    async (authorization) => {
+      const res = await postMcp(httpUrl, { Authorization: authorization });
+
+      expect(res.status).toBe(401);
+      expect(res.wwwAuthenticate).toContain(
+        'resource_metadata="https://mcp.context7.com/.well-known/oauth-protected-resource/mcp"'
+      );
+      expect(res.wwwAuthenticate).not.toContain("invalid_token");
+    }
+  );
+
+  test("exposes the challenge headers to browser clients", async () => {
+    const challenge = await postMcp(httpUrl);
+    expect(challenge.status).toBe(401);
+    expect(challenge.exposeHeaders).toBe("WWW-Authenticate, MCP-Session-Id");
+
+    const preflight = await fetch(httpUrl, {
+      method: "OPTIONS",
+      headers: { Origin: "https://example.test", "Access-Control-Request-Method": "POST" },
+    });
+    expect(preflight.status).toBe(200);
+    expect(preflight.headers.get("access-control-expose-headers")).toBe(
+      "WWW-Authenticate, MCP-Session-Id"
+    );
   });
 
-  test("allows the Claude Code plugin's empty API key fallback", async () => {
-    const res = await postMcp(`${httpUrl}?client=claude-code-plugin`, {
-      Authorization: "",
-    });
+  test("allows an opaque credential for downstream validation", async () => {
+    const res = await postMcp(httpUrl, { Authorization: "Bearer ctx7sk-test" });
 
     expect(res.status).toBe(200);
+    expect(res.wwwAuthenticate).toBeNull();
+  });
+
+  test("observe mode measures missing credentials without denying access", async () => {
+    const observeServer = await startHttpChild({
+      environment: { ...childEnv, MCP_AUTH_ENFORCEMENT: "observe" },
+    });
+    try {
+      const res = await postMcp(observeServer.url);
+      expect(res.status).toBe(200);
+      expect(res.wwwAuthenticate).toBeNull();
+
+      // A scheme-only Authorization header is a missing credential here too.
+      for (const authorization of ["Bearer ", "bearer"]) {
+        const emptyBearer = await postMcp(observeServer.url, { Authorization: authorization });
+        expect(emptyBearer.status).toBe(200);
+        expect(emptyBearer.wwwAuthenticate).toBeNull();
+      }
+    } finally {
+      observeServer.child.kill();
+    }
+  });
+
+  test("observe mode keeps the challenge for OAuth and plugin clients", async () => {
+    const observeServer = await startHttpChild({
+      environment: { ...childEnv, MCP_AUTH_ENFORCEMENT: "observe" },
+    });
+    try {
+      const oauthRes = await postMcp(observeServer.url.replace(/\/mcp$/, "/mcp/oauth"));
+      expect(oauthRes.status).toBe(401);
+      expect(oauthRes.wwwAuthenticate).toContain(
+        'resource_metadata="https://mcp.context7.com/.well-known/oauth-protected-resource/mcp/oauth"'
+      );
+
+      const pluginUrl = `${observeServer.url}?client=claude-code-plugin`;
+      const pluginRes = await postMcp(pluginUrl);
+      expect(pluginRes.status).toBe(401);
+      expect(pluginRes.wwwAuthenticate).toContain(
+        'resource_metadata="https://mcp.context7.com/.well-known/oauth-protected-resource/mcp"'
+      );
+      expect((await postMcp(pluginUrl, { Authorization: "" })).status).toBe(200);
+    } finally {
+      observeServer.child.kill();
+    }
+  });
+
+  test("defaults to required mode when the rollout setting is absent", async () => {
+    const environment = { ...childEnv };
+    delete environment.MCP_AUTH_ENFORCEMENT;
+    const defaultServer = await startHttpChild({ environment });
+    try {
+      const res = await postMcp(defaultServer.url);
+      expect(res.status).toBe(401);
+      expect(res.wwwAuthenticate).toContain(
+        'resource_metadata="https://mcp.context7.com/.well-known/oauth-protected-resource/mcp"'
+      );
+    } finally {
+      defaultServer.child.kill();
+    }
   });
 
   test("keeps the OAuth endpoint protected", async () => {
@@ -788,8 +1532,13 @@ describe("plugin authentication", () => {
       Authorization: "",
     });
 
-    expect((await postMcp(oauthUrl)).status).toBe(401);
+    const missingCredentialRes = await postMcp(oauthUrl);
+    expect(missingCredentialRes.status).toBe(401);
+    expect(missingCredentialRes.wwwAuthenticate).toContain(
+      'resource_metadata="https://mcp.context7.com/.well-known/oauth-protected-resource/mcp/oauth"'
+    );
     expect(emptyHeaderRes.status).toBe(401);
+    expect((await postMcp(oauthUrl, { Authorization: "Bearer ctx7sk-test" })).status).toBe(200);
   });
 
   test("tracks authenticated plugin requests separately", async () => {
@@ -816,5 +1565,161 @@ describe("plugin authentication", () => {
     expect(apiCall?.headers["x-context7-client-ide"]).toBe("claude-code");
     expect(apiCall?.headers["x-context7-client-version"]).toBe("1.0.0");
     expect(apiCall?.headers["x-context7-plugin"]).toBe("claude-code-plugin");
+  });
+});
+
+// Clerk OAuth access tokens are opaque and expire after 24 hours. MCP clients
+// refresh them only on an HTTP 401 (Claude Code 2.1.286 and Cursor 3.23.12
+// refresh silently on a 401, verified 2026-10-06 with a local proxy), so the
+// gate asks the Context7 API about the token before the request reaches the
+// transport instead of letting a tool result carry the rejection.
+describe("expired OAuth access tokens", () => {
+  beforeEach(() => {
+    requests.length = 0;
+  });
+
+  const EXPIRED_CHALLENGE =
+    'Bearer error="invalid_token", error_description="The access token expired or is invalid", resource_metadata="https://mcp.context7.com/.well-known/oauth-protected-resource/mcp';
+
+  test.each([
+    ["/mcp", ""],
+    ["/mcp/oauth", "/oauth"],
+    ["the plugin route", "?client=claude-code-plugin"],
+  ])("challenges an expired token on %s", async (_label, suffix) => {
+    const res = await postMcp(`${httpUrl}${suffix}`, {
+      Authorization: `Bearer oat_expired-${suffix.length}`,
+    });
+
+    expect(res.status).toBe(401);
+    expect(res.wwwAuthenticate).toBe(
+      `${EXPIRED_CHALLENGE}${suffix.startsWith("/oauth") ? "/oauth" : ""}"`
+    );
+    expect(JSON.parse(res.body)).toEqual({
+      jsonrpc: "2.0",
+      error: { code: -32001, message: "The access token expired or is invalid" },
+      id: null,
+    });
+    expect(authChecks()).toHaveLength(1);
+    expect(authChecks()[0].headers.authorization).toBe(`Bearer oat_expired-${suffix.length}`);
+    expect(authChecks()[0].headers["x-context7-source"]).toBe("mcp-server");
+  });
+
+  test("challenges an expired token in observe mode too", async () => {
+    const observeServer = await startHttpChild({
+      environment: { ...childEnv, MCP_AUTH_ENFORCEMENT: "observe" },
+    });
+    try {
+      const res = await postMcp(observeServer.url, { Authorization: "Bearer oat_expired-observe" });
+      expect(res.status).toBe(401);
+      expect(res.wwwAuthenticate).toContain('error="invalid_token"');
+    } finally {
+      observeServer.child.kill();
+    }
+  });
+
+  test("passes a valid token through and serves the request", async () => {
+    const res = await postMcp(httpUrl, { Authorization: "Bearer oat_valid-pass" });
+
+    expect(res.status).toBe(200);
+    expect(res.wwwAuthenticate).toBeNull();
+    expect(authChecks()).toHaveLength(1);
+  });
+
+  test("checks each token at most once per cache window", async () => {
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      expect((await postMcp(httpUrl, { Authorization: "Bearer oat_valid-cached" })).status).toBe(
+        200
+      );
+    }
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      expect((await postMcp(httpUrl, { Authorization: "Bearer oat_expired-cached" })).status).toBe(
+        401
+      );
+    }
+
+    expect(authChecks().map((request) => request.headers.authorization)).toEqual([
+      "Bearer oat_valid-cached",
+      "Bearer oat_expired-cached",
+    ]);
+  });
+
+  test("fails open when the check is unavailable and then trusts the API's rejection", async () => {
+    const headers = { Authorization: "Bearer oat_outage-open" };
+    const first = await postMcp(httpUrl, headers);
+    expect(first.status).toBe(200);
+    expect(first.wwwAuthenticate).toBeNull();
+
+    // The forwarded request is rejected by the API: the tool text explains the
+    // sign-in expired and the gate answers the next request with the 401.
+    const text = await callQueryDocs(httpUrl, headers);
+    expect(text).toBe(
+      "Your Context7 sign-in expired. Retry the request so your MCP client can refresh the sign-in."
+    );
+    expect(requests.filter((request) => request.path === "/v2/context")).toHaveLength(1);
+
+    const next = await postMcp(httpUrl, headers);
+    expect(next.status).toBe(401);
+    expect(next.wwwAuthenticate).toContain('error="invalid_token"');
+  });
+
+  test("leaves API keys and anonymous clients unchanged", async () => {
+    const text = await callQueryDocs(httpUrl, { Authorization: "Bearer ctx7sk-invalid-key" });
+    expect(text).toBe(INVALID_API_KEY_BODY.message);
+
+    expect((await postMcp(httpUrl)).status).toBe(401);
+    expect(authChecks()).toHaveLength(0);
+  });
+
+  test("does not check tokens when validation is switched off", async () => {
+    const offServer = await startHttpChild({
+      environment: { ...childEnv, MCP_OAUTH_TOKEN_VALIDATION: "off" },
+    });
+    try {
+      const res = await postMcp(offServer.url, { Authorization: "Bearer oat_expired-off" });
+      expect(res.status).toBe(200);
+      expect(authChecks()).toHaveLength(0);
+    } finally {
+      offServer.child.kill();
+    }
+  });
+
+  test("keeps the API's own message on stdio", async () => {
+    const client = new Client({ name: "test-harness", version: "1.0.0" });
+    await client.connect(
+      new StdioClientTransport({
+        command: process.execPath,
+        args: [DIST],
+        env: { ...childEnv, CONTEXT7_API_KEY: "oat_expired-stdio" },
+      })
+    );
+    try {
+      const result = await client.callTool({
+        name: "query-docs",
+        arguments: { libraryId: "/vercel/next.js", query: "app router" },
+      });
+      expect(result.content).toMatchObject([
+        { type: "text", text: INVALID_OAUTH_TOKEN_BODY.message },
+      ]);
+    } finally {
+      await client.close();
+    }
+    expect(authChecks()).toHaveLength(0);
+  });
+
+  test("counts expired tokens in the authentication metrics", async () => {
+    await postMcp(httpUrl, { Authorization: "Bearer oat_expired-metrics" });
+
+    let exported = "";
+    for (let attempt = 0; attempt < 30; attempt += 1) {
+      exported = await (await fetch(metricsUrl)).text();
+      if (exported.includes('context7_authentication_outcome="expired"')) break;
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+    expect(exported).toMatch(
+      /context7_mcp_authentication_events_total\{[^}]*context7_authentication_event="credential_rejected"[^}]*context7_authentication_method="oauth"[^}]*context7_authentication_outcome="expired"[^}]*\} [1-9]/
+    );
+    expect(exported).toMatch(
+      /context7_mcp_upstream_requests_total\{[^}]*context7_upstream_operation="auth_check"[^}]*\} [1-9]/
+    );
   });
 });

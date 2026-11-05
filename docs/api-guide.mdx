@@ -19,6 +19,7 @@ Get your API key at [context7.com/dashboard](https://context7.com/dashboard). Le
 | Method | Endpoint | Description |
 |--------|----------|-------------|
 | [Search Documentation](/api-reference/search/search-documentation-in-one-request) | `GET /api/v3/search` | Find relevant documentation without resolving a library first |
+| [Fetch Page](/api-reference/search/read-one-web-page-optionally-narrowed-to-a-question) | `GET /api/v3/fetch` | Read one web page by URL, optionally narrowed to a question |
 | [Search Library](/api-reference/search/search-for-libraries) | `GET /api/v2/libs/search` | Find libraries by name |
 | [Get Context](/api-reference/context/get-documentation-context) | `GET /api/v2/context` | Retrieve documentation snippets for a library |
 | [Refresh Library](/api-reference/refresh/refresh-a-library) | `POST /api/v1/refresh` | Refresh a library's documentation |
@@ -54,8 +55,8 @@ Use `/owner/repo` for GitHub repositories, or `/<source>/<id>` for other sources
 You can pin a specific version with either `/owner/repo/<version>` or `/owner/repo@<version>`:
 
 ```
-/vercel/next.js/v15.1.8
-/vercel/next.js@v15.1.8
+/vercel/next.js/v16.2.9
+/vercel/next.js@v16.2.9
 ```
 
 <Tip>
@@ -146,6 +147,17 @@ for info in docs["infoSnippets"]:
   For TypeScript SDK usage, see [Search](/sdks/ts/commands/search), [Search Library](/sdks/ts/commands/search-library), and [Get Context](/sdks/ts/commands/get-context).
 </Info>
 
+## MCP Tools
+
+The [Context7 MCP server](/resources/all-clients) exposes the same lookups as agent tools. Each tool maps to one REST endpoint, with the same parameters as the query fields:
+
+| MCP tool | Endpoint | Parameters |
+|----------|----------|------------|
+| `resolve-library-id` | [Search Library](/api-reference/search/search-for-libraries) — `GET /api/v2/libs/search` | `libraryName`, `query` |
+| `query-docs` | [Get Context](/api-reference/context/get-documentation-context) — `GET /api/v2/context` | `libraryId`, `query`, `language` |
+
+Call the REST API directly to control requests from your own code, or use the MCP tools when you want an agent to fetch documentation automatically during inference. Both use the same [API key](#authentication).
+
 ## Rate Limits
 
 - **Without API key**: Low rate limits and no custom configuration
@@ -169,7 +181,7 @@ Use detailed, natural language queries for better results:
 
 ```bash
 # Good - specific question
-curl "https://context7.com/api/v2/context?libraryId=/vercel/next.js&query=How%20to%20implement%20authentication%20with%20middleware" \
+curl "https://context7.com/api/v2/context?libraryId=/vercel/next.js&query=How%20to%20implement%20authentication%20with%20a%20proxy" \
   -H "Authorization: Bearer CONTEXT7_API_KEY"
 
 # Less optimal - vague query
@@ -225,12 +237,14 @@ def fetch_with_retry(url, headers, max_retries=3):
 Pin to a specific version for consistent results. Both `/` and `@` syntax are supported:
 
 ```bash
-curl "https://context7.com/api/v2/context?libraryId=/vercel/next.js/v15.1.8&query=app%20router" \
+curl "https://context7.com/api/v2/context?libraryId=/vercel/next.js/v16.2.9&query=app%20router" \
   -H "Authorization: Bearer CONTEXT7_API_KEY"
 
-curl "https://context7.com/api/v2/context?libraryId=/vercel/next.js@v15.1.8&query=app%20router" \
+curl "https://context7.com/api/v2/context?libraryId=/vercel/next.js@v16.2.9&query=app%20router" \
   -H "Authorization: Bearer CONTEXT7_API_KEY"
 ```
+
+If that version is not indexed, the request still succeeds and serves the closest documentation Context7 has: a tag matching the requested numbers, a newer release of the same line, or the library's current documentation. JSON responses include a `version` object that says which version was served. A text response starts with a version note when it serves another release or the current documentation. A branch or channel name that is not indexed, such as `/vercel/next.js/canary`, still returns `404 version_not_found`.
 
 ## Error Handling
 

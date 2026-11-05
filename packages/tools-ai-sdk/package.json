@@ -1,6 +1,6 @@
 {
   "name": "@upstash/context7-tools-ai-sdk",
-  "version": "1.0.2",
+  "version": "1.0.3",
   "description": "Context7 tools for Vercel AI SDK",
   "type": "module",
   "main": "./dist/index.cjs",
@@ -36,7 +36,7 @@
   "devDependencies": {
     "@upstash/context7-sdk": "workspace:*",
     "ai": "^6.0.5",
-    "zod": "^4.4.3",
+    "zod": "^4.6.5",
     "@openrouter/ai-sdk-provider": "^2.10.0",
     "@types/node": "catalog:",
     "dotenv": "catalog:",

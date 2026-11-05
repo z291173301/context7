@@ -28,6 +28,7 @@ export type DocumentState = "initial" | "finalized" | "error" | "delete";
 export type ContextRequest = {
   query: string;
   libraryId: string;
+  language?: string;
 };
 
 export type ContextResponse = {
@@ -43,8 +44,12 @@ export interface ClientContext {
     version?: string;
   };
   plugin?: string;
+  mcpEndpoint?: "/mcp" | "/mcp/oauth";
+  mcpAuthMode?: "observe" | "required";
   transport?: "stdio" | "http";
   sessionId?: string;
+  /** Research preview is on; sent as `X-Context7-Research-Preview: 1` so the app counts preview use. */
+  researchPreview?: boolean;
   /** Mutable: set by the upstream API layer when the backend signals the
    *  client should be prompted to sign in. Read by the auth-prompt wrapper. */
   shouldPrompt?: boolean;

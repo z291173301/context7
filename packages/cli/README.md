@@ -28,21 +28,48 @@ ctx7 setup --opencode
 ctx7 setup --vscode
 ctx7 setup --devin
 ctx7 setup --copilot
+ctx7 setup --pi
 ```
 
 ### Library Documentation
 
 ```bash
+# Search documentation in one request
+ctx7 search "how to stream an OpenAI response from a Next.js route"
+
+# Narrow the search to libraries you already know
+ctx7 search "how to stream a response" --library Next.js --library OpenAI
+
 # Find a library
 ctx7 library react
 ctx7 library nextjs "app router"
 
 # Get documentation
 ctx7 docs /facebook/react "useEffect cleanup"
-ctx7 docs /vercel/next.js "middleware"
+ctx7 docs /vercel/next.js "proxy"
 ```
 
 ## Usage
+
+### Search documentation
+
+Ask a question and get the best snippets from all libraries in one step. No library ID is needed.
+
+```bash
+ctx7 search "how do I validate a request body with a schema?"
+
+# Search specific libraries: a name or a library ID, repeat for up to four
+ctx7 search "how do I stream a response?" --library Next.js --library /openai/openai-node
+
+# Search a specific version
+ctx7 search "how do I cache a server function?" --library Next.js --library-version 15.4.0
+
+# Prefer results in the language you write in
+ctx7 search "how do I send an SMS?" --library Twilio --language Ruby
+
+# Output as JSON
+ctx7 search "how do I use hooks?" --library React --json
+```
 
 ### Find a library
 
@@ -63,7 +90,7 @@ Fetch documentation for a specific library using its Context7 ID.
 
 ```bash
 ctx7 docs /facebook/react "useEffect cleanup"
-ctx7 docs /vercel/next.js "middleware authentication"
+ctx7 docs /vercel/next.js "proxy authentication"
 ctx7 docs /prisma/prisma "one-to-many relations"
 
 # Output as JSON
@@ -85,6 +112,7 @@ ctx7 setup --opencode
 ctx7 setup --vscode
 ctx7 setup --devin
 ctx7 setup --copilot
+ctx7 setup --pi
 
 # Use an existing API key instead of OAuth
 ctx7 setup --api-key YOUR_API_KEY
@@ -128,6 +156,7 @@ ctx7 remove --claude --project
 ctx7 remove --vscode --project
 ctx7 remove --devin --project
 ctx7 remove --copilot --project
+ctx7 remove --pi --project
 
 # Remove both setup modes explicitly
 ctx7 remove --cursor --all
@@ -156,7 +185,7 @@ ctx7 logout
 
 ## Supported Clients
 
-The CLI automatically detects which AI coding assistants you have installed and configures Context7 for them:
+The CLI automatically detects which AI coding agents you have installed and configures Context7 for them:
 
 | Client                                                              | Skills Directory  |
 | ------------------------------------------------------------------- | ----------------- |

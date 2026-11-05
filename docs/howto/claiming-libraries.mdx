@@ -138,9 +138,9 @@ These fields are available for all library types.
 | Field             | Description                                                                                               | Limits             |
 | ----------------- | --------------------------------------------------------------------------------------------------------- | ------------------ |
 | **Project Title** | Library name shown on Context7 and given to coding agents. Replaces the generated name.                   | Max 100 characters |
-| **Description**   | Brief description of your library's purpose, shown on Context7 and given to coding agents.                | Max 200 characters |
+| **Description**   | Brief description of your library's purpose, shown on Context7 and given to coding agents.                | Max 500 characters |
 
-Context7 checks a new title or description before it saves it. If the text gives instructions to AI agents instead of describing the library, the save fails with a reason and the current text stays.
+Context7 checks a new title or description before it saves it. If the text gives instructions to AI agents, or is a slogan or promotional offer instead of a description of the library, the save fails with a reason and the current text stays.
 
 ### Source Settings
 
@@ -175,9 +175,26 @@ Context7 checks a new title or description before it saves it. If the text gives
     | ---------------------------- | ------------------------------------------------------------------------------------------------ | ------------------------------- |
     | **Base URL**                 | The root URL to crawl for documentation.                                                         | Max 100 characters              |
     | **Display URL**              | Optional URL shown to users instead of the base URL.                                             | Max 500 characters              |
-    | **Keep Hash (URL Fragments)**| Whether to treat URLs with different hash fragments as distinct pages. Disabled by default.      | Boolean                         |
     | **Keep Query Parameters**    | Whether to treat URLs with different query strings as distinct pages. Enabled by default.        | Boolean                         |
     | **Exclude URLs**             | URL patterns to exclude from crawling. Supports wildcards.                                       | Max 100 patterns                |
+
+    <Note>
+      The crawl stays under the Base URL. A Base URL without a trailing slash is a plain
+      prefix, so `https://example.com/docs/api/admin` also includes
+      `https://example.com/docs/api/admin-graphql/...`. Add a trailing slash to keep the
+      folder boundary: `https://example.com/docs/` includes `/docs` and `/docs/x` but
+      not `/docs-old`.
+
+      Hash fragments (`#...`) are not indexed. Pages that differ only by their fragment, such as
+      hash-routed documentation sites, are crawled as a single page.
+
+      An Exclude URLs pattern that leaves out old releases does not stop a version at that URL
+      from being crawled.
+
+      A library that was first added at a page inside the site crawls from that page, not from the
+      Base URL. Saving a new Base URL moves the crawl to the Base URL when that page is outside it;
+      a page still under the new Base URL stays the start page.
+    </Note>
   </Tab>
 </Tabs>
 
@@ -200,8 +217,11 @@ Available for Git repositories and websites.
 | Field                                | Description                                                                                                                                    | Limits  |
 | ------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------- | ------- |
 | **Skip Automatic Version Detection** | By default, outdated library versions are automatically detected and excluded from indexing. Enable to include all versions regardless of age. | Boolean |
+| **Generate docs** | Private repositories only. An AI agent writes documentation from the source code on each refresh with new commits, and each run is billed as parsing. When disabled, the next refresh removes the generated pages. | Boolean |
 | **Redirect URL**      | Redirect users to a different library. Leave empty to disable.                                              | Max 500 characters |
 | **Disallow Indexing** | Opt-out from Context7. When enabled, documentation content is removed and the library becomes inaccessible. | Boolean            |
+
+Context7 refuses a redirect to the library itself, a redirect that would form a loop, and a chain longer than three redirects, counting libraries that already redirect to yours. Readers follow up to three redirects. Point the redirect at the library the chain ends at.
 
 ## Managing Versions
 
@@ -215,6 +235,7 @@ You can add versions using either:
 
 - **Git tags**: Reference a specific release tag (e.g., `v1.2.0`)
 - **Git branches**: Reference a branch for version-specific documentation (e.g., `release-1.x`)
+- **Website versions**: For a website library, enter the **Version URL** of the documentation for that version (e.g., `https://docs.example.com/2.0/`). The URL must be on the same site as the library. As an owner, you can also add a release that lives under a different path of that site's documentation, such as one manual of a portal (e.g., `https://dev.mysql.com/doc/refman/8.0/en/` for a library whose docs are under `https://dev.mysql.com/doc/`). A URL without a version replaces the latest version.
 
 | Limit            | Value             |
 | ---------------- | ----------------- |
