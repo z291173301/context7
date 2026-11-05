@@ -1,5 +1,15 @@
 # @upstash/context7-mcp
 
+## 4.6.0
+
+### Minor Changes
+
+- 76d68b5: Add the `get-upgrade-guide` research preview tool: everything that changes between two versions of a library in one response, from the release notes and guides of every release in between and the public API diff of both versions.
+
+### Patch Changes
+
+- fc65a5a: Keep the teamspace library-filter notice in resolve-library-id results when no libraries match.
+
 ## 4.5.0
 
 ### Minor Changes
